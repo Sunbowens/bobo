@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -200,6 +201,74 @@ def to_json(repos: Iterable[Repo]) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Slack
+# --------------------------------------------------------------------------- #
+def to_slack_payload(
+    repos: Iterable[Repo], since: str = "daily", limit: int = 15
+) -> dict:
+    """构造 Slack Incoming Webhook 的消息 (Block Kit)。"""
+    repos = list(repos)[:limit]
+    date = _dt.date.today().isoformat()
+    title = f":fire: GitHub 热门项目 · {since} · {date}"
+    blocks: list[dict] = [
+        {"type": "header", "text": {"type": "plain_text", "text": title, "emoji": True}}
+    ]
+    if not repos:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "_未获取到任何热门项目。_"},
+            }
+        )
+        return {"text": title, "blocks": blocks}
+
+    # 每行一个仓库；Slack 单个 section 上限 3000 字符，按需分块。
+    lines, chunks, size = [], [], 0
+    for r in repos:
+        star = f"  ·  +{r.stars_period:,} ⭐" if r.stars_period else ""
+        lang = f"  ·  `{r.language}`" if r.language else ""
+        desc = f"\n{r.description}" if r.description else ""
+        line = (
+            f"*{r.rank}.* <{r.url}|{r.full_name}>{lang}"
+            f"  ·  ⭐ {r.stars:,}{star}{desc}"
+        )
+        if size + len(line) > 2800 and lines:
+            chunks.append("\n\n".join(lines))
+            lines, size = [], 0
+        lines.append(line)
+        size += len(line)
+    if lines:
+        chunks.append("\n\n".join(lines))
+
+    for chunk in chunks:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
+    blocks.append(
+        {
+            "type": "context",
+            "elements": [
+                {"type": "mrkdwn", "text": f"来源 https://github.com/trending?since={since}"}
+            ],
+        }
+    )
+    return {"text": title, "blocks": blocks}
+
+
+def post_to_slack(webhook_url: str, payload: dict, timeout: int = 20) -> None:
+    """把消息 POST 到 Slack Incoming Webhook。失败时抛出异常。"""
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        webhook_url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        body = resp.read().decode("utf-8", errors="replace")
+        if body.strip() != "ok":
+            raise RuntimeError(f"Slack 返回异常: {body!r}")
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
@@ -225,6 +294,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="输出格式 (默认: console)",
     )
     p.add_argument("--output", "-o", help="写入文件, 而非标准输出")
+    p.add_argument(
+        "--slack",
+        nargs="?",
+        const="",
+        metavar="WEBHOOK_URL",
+        help="推送到 Slack Incoming Webhook；不给值时读取环境变量 SLACK_WEBHOOK_URL",
+    )
+    p.add_argument(
+        "--slack-limit",
+        type=int,
+        default=15,
+        help="推送到 Slack 时最多展示的项目数 (默认: 15)",
+    )
     return p
 
 
@@ -240,6 +322,25 @@ def main(argv: list[str] | None = None) -> int:
     except urllib.error.URLError as exc:  # 网络错误
         print(f"抓取失败: {exc}", file=sys.stderr)
         return 1
+
+    # 推送到 Slack（可与其它输出并存）。
+    if args.slack is not None:
+        webhook = args.slack or os.environ.get("SLACK_WEBHOOK_URL", "")
+        if not webhook:
+            print(
+                "未提供 Slack Webhook：请用 --slack <URL> 或设置环境变量 SLACK_WEBHOOK_URL",
+                file=sys.stderr,
+            )
+            return 2
+        payload = to_slack_payload(repos, args.since, args.slack_limit)
+        try:
+            post_to_slack(webhook, payload)
+        except (urllib.error.URLError, RuntimeError) as exc:
+            print(f"推送 Slack 失败: {exc}", file=sys.stderr)
+            return 1
+        print(f"已推送 {min(len(repos), args.slack_limit)} 个项目到 Slack", file=sys.stderr)
+        if not args.output and args.format == "console":
+            return 0  # 仅推送 Slack，不再打印到控制台
 
     if args.format == "markdown":
         text = to_markdown(repos, args.since)

@@ -1,4 +1,5 @@
 """trending.py 的单元测试 (仅标准库, 用 `python3 -m unittest` 运行)。"""
+import json
 import unittest
 from unittest import mock
 
@@ -77,12 +78,64 @@ class RenderTest(unittest.TestCase):
         self.assertIn("未获取到", trending.to_console([], "daily"))
 
 
+class SlackTest(unittest.TestCase):
+    def setUp(self):
+        self.repos = trending.parse(FIXTURE, "daily")
+
+    def test_payload_shape(self):
+        p = trending.to_slack_payload(self.repos, "daily")
+        self.assertEqual(p["blocks"][0]["type"], "header")
+        self.assertTrue(any(b["type"] == "section" for b in p["blocks"]))
+        self.assertIn("octocat/hello-world", json.dumps(p, ensure_ascii=False))
+
+    def test_empty_payload(self):
+        p = trending.to_slack_payload([], "daily")
+        self.assertIn("未获取到", json.dumps(p, ensure_ascii=False))
+
+    def test_section_char_limit(self):
+        p = trending.to_slack_payload(self.repos * 80, "daily", limit=160)
+        for b in p["blocks"]:
+            if b["type"] == "section":
+                self.assertLessEqual(len(b["text"]["text"]), 3000)
+
+    def test_post_ok(self):
+        resp = mock.MagicMock()
+        resp.read.return_value = b"ok"
+        resp.__enter__.return_value = resp
+        with mock.patch("urllib.request.urlopen", return_value=resp) as op:
+            trending.post_to_slack("http://x/hook", {"text": "hi"})
+            self.assertEqual(op.call_args[0][0].get_method(), "POST")
+
+    def test_post_non_ok_raises(self):
+        resp = mock.MagicMock()
+        resp.read.return_value = b"invalid_payload"
+        resp.__enter__.return_value = resp
+        with mock.patch("urllib.request.urlopen", return_value=resp):
+            with self.assertRaises(RuntimeError):
+                trending.post_to_slack("http://x/hook", {"text": "hi"})
+
+
 class CliTest(unittest.TestCase):
     def test_main_markdown(self):
         with mock.patch("trending.fetch", return_value=FIXTURE), mock.patch(
             "builtins.print"
         ):
             self.assertEqual(trending.main(["--format", "markdown"]), 0)
+
+    def test_main_slack_missing_webhook(self):
+        env = {k: v for k, v in __import__("os").environ.items()}
+        env.pop("SLACK_WEBHOOK_URL", None)
+        with mock.patch("trending.fetch", return_value=FIXTURE), mock.patch(
+            "builtins.print"
+        ), mock.patch.dict("os.environ", env, clear=True):
+            self.assertEqual(trending.main(["--slack"]), 2)
+
+    def test_main_slack_posts(self):
+        with mock.patch("trending.fetch", return_value=FIXTURE), mock.patch(
+            "trending.post_to_slack"
+        ) as post, mock.patch("builtins.print"):
+            self.assertEqual(trending.main(["--slack", "http://x/hook"]), 0)
+            post.assert_called_once()
 
 
 if __name__ == "__main__":

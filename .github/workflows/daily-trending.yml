@@ -37,6 +37,15 @@ jobs:
           python3 trending.py --since "$SINCE" --format markdown \
             --output "reports/latest.md"
 
+      - name: 推送到 Slack
+        # 仅在配置了 SLACK_WEBHOOK_URL 这个仓库 Secret 时才推送
+        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
+        env:
+          SINCE: ${{ github.event.inputs.since || 'daily' }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python3 trending.py --since "$SINCE" --slack --slack-limit 15
+
       - name: 提交结果
         run: |
           git config user.name "github-actions[bot]"
